@@ -214,6 +214,7 @@ HTML_TEMPLATE = """
     .summary-pill.team-def  { border-color:#22c55e; color:#bbf7d0; }
     .summary-pill.team-sub  { border-color:#6366f1; color:#c7d2fe; }
     .summary-pill.team-unassigned { border-color:#4b5563; color:#e5e7eb; }
+    .summary-pill.team-leave { border-color:#fb7185; color:#fecdd3; }
 
     .team-block {
       border-radius:16px;
@@ -268,13 +269,14 @@ HTML_TEMPLATE = """
     .badge.team-def  { background:#22c55e; color:#022c22; }
     .badge.team-sub  { background:#6366f1; color:#e5e7eb; }
     .badge.team-unassigned { background:#4b5563; color:#e5e7eb; }
+    .badge.team-leave { background:#fb7185; color:#0f0f0f; } /* 粉紅色 */
 
   </style>
 </head>
 <body>
   <h1>⚔ 幫戰報名管理後台</h1>
   <p class="sub">
-    這裡可以檢視所有報名名單，並調整每位成員的隊伍（進攻1 / 進攻2 / 防守 / 替補 / 未分配）。<br>
+    這裡可以檢視所有報名名單，並調整每位成員的隊伍（進攻1 / 進攻2 / 防守 / 替補 / 請假/未分配）。<br>
     調整後記得按下方「儲存隊伍調整」，隊伍會同步寫入 signups.json 與匯出的 CSV。
   </p>
 
@@ -324,12 +326,14 @@ HTML_TEMPLATE = """
                 </td>
                 <td>
                   <select name="team_{{ row.guild_id }}_{{ row.user_id }}">
-                    <option value="未分配" {% if row.team == "未分配" %}selected{% endif %}>未分配</option>
-                    <option value="進攻1" {% if row.team == "進攻1" %}selected{% endif %}>進攻1</option>
-                    <option value="進攻2" {% if row.team == "進攻2" %}selected{% endif %}>進攻2</option>
-                    <option value="防守" {% if row.team == "防守" %}selected{% endif %}>防守</option>
-                    <option value="替補" {% if row.team == "替補" %}selected{% endif %}>替補</option>
-                  </select>
+    <option value="未分配" {% if row.team == "未分配" %}selected{% endif %}>未分配</option>
+    <option value="進攻1" {% if row.team == "進攻1" %}selected{% endif %}>進攻1</option>
+    <option value="進攻2" {% if row.team == "進攻2" %}selected{% endif %}>進攻2</option>
+    <option value="防守" {% if row.team == "防守" %}selected{% endif %}>防守</option>
+    <option value="替補" {% if row.team == "替補" %}selected{% endif %}>替補</option>
+    <option value="請假" {% if row.team == "請假" %}selected{% endif %}>請假</option>
+</select>
+
                 </td>
                 <td>{{ row.timestamp }}</td>
               </tr>
@@ -366,17 +370,20 @@ def index():
         return redirect(url_for("index"))
 
     # GET：顯示畫面（分隊伍分區塊）
-    teams_order = ["進攻1", "進攻2", "防守", "替補", "未分配"]
+    teams_order = ["進攻1", "進攻2", "防守", "替補", "請假", "未分配"]
+
     team_blocks = {t: [] for t in teams_order}
 
     # 顏色 / 樣式 class
     class_map = {
-        "進攻1": "team-off1",
-        "進攻2": "team-off2",
-        "防守": "team-def",
-        "替補": "team-sub",
-        "未分配": "team-unassigned",
-    }
+    "進攻1": "team-off1",
+    "進攻2": "team-off2",
+    "防守": "team-def",
+    "替補": "team-sub",
+    "請假": "team-leave",
+    "未分配": "team-unassigned",
+}
+
 
     for gid, guild_data in data.items():
         for uid, info in guild_data.items():
