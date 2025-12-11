@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request, redirect, url_for
 
 DATA_FILE = "signups.json"
 
@@ -74,6 +74,9 @@ async def signup(
         await interaction.response.send_message("⚠️ 請在伺服器頻道內使用此指令。", ephemeral=True)
         return
 
+    existing = get_guild_signups(guild.id).get(str(user.id), {})
+    team = existing.get("team", "未分配")
+
     info = {
         "user_id": user.id,
         "user_name": f"{user.name}#{user.discriminator}",
@@ -83,6 +86,7 @@ async def signup(
         "availability": availability,
         "voice": voice,
         "note": note,
+        "team": team,  # ⭐ 新增：隊伍資訊
         "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 
@@ -152,7 +156,8 @@ async def list_signups(interaction: discord.Interaction):
         return
 
     output = io.StringIO()
-    headers = ["UserID", "顯示名稱", "職業流派", "裝備境界", "可出席時段", "語音狀況", "備註", "最後更新時間"]
+    # ⭐ 標題多一欄「隊伍」
+    headers = ["UserID", "顯示名稱", "職業流派", "裝備境界", "可出席時段", "語音狀況", "隊伍", "備註", "最後更新時間"]
     output.write(",".join(headers) + "\n")
 
     for uid, info in data.items():
@@ -163,6 +168,7 @@ async def list_signups(interaction: discord.Interaction):
             info.get("gear", "").replace(",", "，"),
             info.get("availability", "").replace(",", "，"),
             info.get("voice", "").replace(",", "，"),
+            info.get("team", "未分配").replace(",", "，"),  # ⭐ 新增：隊伍欄位
             info.get("note", "").replace("\n", " ").replace(",", "，"),
             info.get("timestamp", ""),
         ]
@@ -176,6 +182,7 @@ async def list_signups(interaction: discord.Interaction):
         file=file,
         ephemeral=True,
     )
+
 
 # ========= Flask Web 後台 =========
 
@@ -194,9 +201,10 @@ HTML_TEMPLATE = """
     th, td { border: 1px solid #27313f; padding: 6px 8px; text-align: left; }
     th { background: #111827; }
     tr:nth-child(even) { background: #0b1220; }
-    .tag { display:inline-block; padding:2px 6px; border-radius:999px; border:1px solid #4b5563; font-size:11px; margin-right:4px; }
-    .tag-guild { border-color:#00e8d1; color:#00e8d1; }
     .muted { color:#9ca3af; font-size:12px; }
+    select { background:#020617; color:#e5e7eb; border:1px solid #374151; padding:3px 6px; border-radius:6px; font-size:12px; }
+    button { margin-top:12px; padding:6px 12px; border-radius:999px; border:none; background:#00e8d1; color:#020617; font-weight:600; cursor:pointer; }
+    button:hover { opacity:0.9; }
   </style>
 </head>
 <body>
@@ -204,54 +212,87 @@ HTML_TEMPLATE = """
   <p class="muted">
     共 <strong>{{ total }}</strong> 筆資料，
     目前從 <strong>{{ guild_count }}</strong> 個伺服器彙整。<br>
-    此頁面為唯讀，如需調整資料請在 Discord 內請成員重新 /signup。
+    你可以在這裡調整每位成員的隊伍（主力 / 替補 / 預備），調整後記得按下方「儲存隊伍調整」。
   </p>
-  <table>
-    <tr>
-      <th>伺服器 ID</th>
-      <th>顯示名稱</th>
-      <th>職業 / 流派</th>
-      <th>裝備 / 境界</th>
-      <th>可出席時段</th>
-      <th>語音</th>
-      <th>備註</th>
-      <th>最後更新</th>
-    </tr>
-    {% for row in rows %}
-    <tr>
-      <td>{{ row.guild_id }}</td>
-      <td>{{ row.display_name }}</td>
-      <td>{{ row.job }}</td>
-      <td>{{ row.gear }}</td>
-      <td>{{ row.availability }}</td>
-      <td>{{ row.voice }}</td>
-      <td>{{ row.note }}</td>
-      <td>{{ row.timestamp }}</td>
-    </tr>
-    {% endfor %}
-  </table>
+
+  <form method="post" action="{{ url_for('index') }}">
+    <table>
+      <tr>
+        <th>伺服器 ID</th>
+        <th>顯示名稱</th>
+        <th>職業 / 流派</th>
+        <th>裝備 / 境界</th>
+        <th>可出席時段</th>
+        <th>語音</th>
+        <th>備註</th>
+        <th>隊伍</th>
+        <th>最後更新</th>
+      </tr>
+      {% for row in rows %}
+      <tr>
+        <td>{{ row.guild_id }}</td>
+        <td>{{ row.display_name }}</td>
+        <td>{{ row.job }}</td>
+        <td>{{ row.gear }}</td>
+        <td>{{ row.availability }}</td>
+        <td>{{ row.voice }}</td>
+        <td>{{ row.note }}</td>
+        <td>
+          <select name="team_{{ row.guild_id }}_{{ row.user_id }}">
+            <option value="未分配" {% if row.team == "未分配" %}selected{% endif %}>未分配</option>
+            <option value="主力" {% if row.team == "主力" %}selected{% endif %}>主力</option>
+            <option value="替補" {% if row.team == "替補" %}selected{% endif %}>替補</option>
+            <option value="預備" {% if row.team == "預備" %}selected{% endif %}>預備</option>
+          </select>
+        </td>
+        <td>{{ row.timestamp }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+
+    <button type="submit">💾 儲存隊伍調整</button>
+    <p class="muted">儲存後，隊伍資訊會寫入 signups.json，也會反映在日後匯出的 CSV 裡。</p>
+  </form>
 </body>
 </html>
 """
 
-@app.route("/")
+@app.route("/", methods=["GET", "POST"])
 def index():
     data = load_signups()
+
+    # 如果是從網頁送出隊伍調整（POST）
+    if request.method == "POST":
+        # 逐筆處理 form 裡的 team_xxx_yyy
+        for key, value in request.form.items():
+            if not key.startswith("team_"):
+                continue
+            _, gid, uid = key.split("_", 2)
+            if gid in data and uid in data[gid]:
+                data[gid][uid]["team"] = value  # 更新隊伍
+        save_signups(data)      # 寫回檔案
+        signups.clear()
+        signups.update(data)
+        return redirect(url_for("index"))
+
+    # GET：顯示畫面
     rows = []
     for gid, guild_data in data.items():
         for uid, info in guild_data.items():
             rows.append({
                 "guild_id": gid,
+                "user_id": uid,
                 "display_name": info.get("display_name", ""),
                 "job": info.get("job", ""),
                 "gear": info.get("gear", ""),
                 "availability": info.get("availability", ""),
                 "voice": info.get("voice", ""),
                 "note": info.get("note", ""),
+                "team": info.get("team", "未分配"),
                 "timestamp": info.get("timestamp", ""),
             })
 
-    rows.sort(key=lambda x: (x["guild_id"], x["display_name"]))  # 簡單排序
+    rows.sort(key=lambda x: (x["guild_id"], x["display_name"]))
 
     return render_template_string(
         HTML_TEMPLATE,
