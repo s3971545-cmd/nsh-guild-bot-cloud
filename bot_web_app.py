@@ -1,0 +1,279 @@
+import os
+import json
+import io
+import threading
+from datetime import datetime
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from flask import Flask, render_template_string
+
+DATA_FILE = "signups.json"
+
+# ========= 資料存取 =========
+
+def load_signups():
+    if not os.path.exists(DATA_FILE):
+        return {}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+def save_signups(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+signups = load_signups()  # { guild_id: { user_id: {...} } }
+
+def get_guild_signups(guild_id: int):
+    gid = str(guild_id)
+    return signups.get(gid, {})
+
+def set_signup(guild_id: int, user_id: int, info: dict):
+    gid = str(guild_id)
+    uid = str(user_id)
+    if gid not in signups:
+        signups[gid] = {}
+    signups[gid][uid] = info
+    save_signups(signups)
+
+# ========= Discord Bot =========
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    print(f"✅ Discord Bot 已登入為 {bot.user}，Slash 指令已同步。")
+
+@bot.tree.command(name="signup", description="幫戰報名 / 更新資料")
+@app_commands.describe(
+    job="職業 / 流派（例：鐵衣-XX流）",
+    gear="裝備 / 境界（例：戰力 25 萬、XX 境）",
+    availability="常態可出席時段（例：週三日 20:30 後）",
+    voice="語音狀況（可講話 / 只聽指揮 / 無法語音）",
+    note="備註（擅長打法、位置、經驗… 可留空）",
+)
+async def signup(
+    interaction: discord.Interaction,
+    job: str,
+    gear: str,
+    availability: str,
+    voice: str,
+    note: str = "",
+):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None:
+        await interaction.response.send_message("⚠️ 請在伺服器頻道內使用此指令。", ephemeral=True)
+        return
+
+    info = {
+        "user_id": user.id,
+        "user_name": f"{user.name}#{user.discriminator}",
+        "display_name": user.display_name,
+        "job": job,
+        "gear": gear,
+        "availability": availability,
+        "voice": voice,
+        "note": note,
+        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+    set_signup(guild.id, user.id, info)
+
+    embed = discord.Embed(
+        title="✅ 幫戰報名成功",
+        description="你的資料已登記 / 更新完畢，如需修改再用 `/signup` 即可。",
+        color=0x00d1c4,
+    )
+    embed.add_field(name="顯示名稱", value=info["display_name"], inline=False)
+    embed.add_field(name="職業 / 流派", value=job, inline=True)
+    embed.add_field(name="裝備 / 境界", value=gear, inline=True)
+    embed.add_field(name="可出席時段", value=availability, inline=False)
+    embed.add_field(name="語音狀況", value=voice, inline=True)
+    embed.add_field(name="備註", value=note if note else "（無）", inline=False)
+    embed.set_footer(text="如需修改，直接再次使用 /signup 覆寫即可。")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="mysignup", description="查看自己幫戰報名資料")
+async def mysignup(interaction: discord.Interaction):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None:
+        await interaction.response.send_message("⚠️ 請在伺服器頻道內使用此指令。", ephemeral=True)
+        return
+
+    data = get_guild_signups(guild.id)
+    info = data.get(str(user.id))
+
+    if not info:
+        await interaction.response.send_message("你還沒有填寫幫戰報名，可以使用 `/signup` 登記。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📋 你的幫戰報名資料",
+        color=0x00d1c4,
+    )
+    embed.add_field(name="顯示名稱", value=info.get("display_name", "（無）"), inline=False)
+    embed.add_field(name="職業 / 流派", value=info.get("job", "（無）"), inline=True)
+    embed.add_field(name="裝備 / 境界", value=info.get("gear", "（無）"), inline=True)
+    embed.add_field(name="可出席時段", value=info.get("availability", "（無）"), inline=False)
+    embed.add_field(name="語音狀況", value=info.get("voice", "（無）"), inline=True)
+    embed.add_field(name="備註", value=info.get("note", "（無）"), inline=False)
+    embed.set_footer(text=f"最後更新時間：{info.get('timestamp', '未知')}")
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="list_signups", description="匯出幫戰報名 CSV（管理員用）")
+async def list_signups(interaction: discord.Interaction):
+    guild = interaction.guild
+    user = interaction.user
+
+    if guild is None:
+        await interaction.response.send_message("⚠️ 請在伺服器頻道內使用此指令。", ephemeral=True)
+        return
+
+    if not user.guild_permissions.manage_guild:
+        await interaction.response.send_message("🚫 你沒有使用此指令的權限（需管理伺服器權限）。", ephemeral=True)
+        return
+
+    data = get_guild_signups(guild.id)
+    if not data:
+        await interaction.response.send_message("目前沒有任何幫戰報名資料。", ephemeral=True)
+        return
+
+    output = io.StringIO()
+    headers = ["UserID", "顯示名稱", "職業流派", "裝備境界", "可出席時段", "語音狀況", "備註", "最後更新時間"]
+    output.write(",".join(headers) + "\n")
+
+    for uid, info in data.items():
+        row = [
+            uid,
+            info.get("display_name", "").replace(",", "，"),
+            info.get("job", "").replace(",", "，"),
+            info.get("gear", "").replace(",", "，"),
+            info.get("availability", "").replace(",", "，"),
+            info.get("voice", "").replace(",", "，"),
+            info.get("note", "").replace("\n", " ").replace(",", "，"),
+            info.get("timestamp", ""),
+        ]
+        output.write(",".join(row) + "\n")
+
+    output.seek(0)
+    file = discord.File(fp=io.BytesIO(output.getvalue().encode("utf-8")), filename="signups.csv")
+
+    await interaction.response.send_message(
+        content=f"📂 共有 **{len(data)}** 筆幫戰報名資料，以下為匯出檔：",
+        file=file,
+        ephemeral=True,
+    )
+
+# ========= Flask Web 後台 =========
+
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <title>幫戰報名管理後台</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 20px; background: #05060a; color: #e6edf7; }
+    h1 { color: #00e8d1; }
+    table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 13px; }
+    th, td { border: 1px solid #27313f; padding: 6px 8px; text-align: left; }
+    th { background: #111827; }
+    tr:nth-child(even) { background: #0b1220; }
+    .tag { display:inline-block; padding:2px 6px; border-radius:999px; border:1px solid #4b5563; font-size:11px; margin-right:4px; }
+    .tag-guild { border-color:#00e8d1; color:#00e8d1; }
+    .muted { color:#9ca3af; font-size:12px; }
+  </style>
+</head>
+<body>
+  <h1>⚔ 幫戰報名管理後台</h1>
+  <p class="muted">
+    共 <strong>{{ total }}</strong> 筆資料，
+    目前從 <strong>{{ guild_count }}</strong> 個伺服器彙整。<br>
+    此頁面為唯讀，如需調整資料請在 Discord 內請成員重新 /signup。
+  </p>
+  <table>
+    <tr>
+      <th>伺服器 ID</th>
+      <th>顯示名稱</th>
+      <th>職業 / 流派</th>
+      <th>裝備 / 境界</th>
+      <th>可出席時段</th>
+      <th>語音</th>
+      <th>備註</th>
+      <th>最後更新</th>
+    </tr>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.guild_id }}</td>
+      <td>{{ row.display_name }}</td>
+      <td>{{ row.job }}</td>
+      <td>{{ row.gear }}</td>
+      <td>{{ row.availability }}</td>
+      <td>{{ row.voice }}</td>
+      <td>{{ row.note }}</td>
+      <td>{{ row.timestamp }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>
+"""
+
+@app.route("/")
+def index():
+    data = load_signups()
+    rows = []
+    for gid, guild_data in data.items():
+        for uid, info in guild_data.items():
+            rows.append({
+                "guild_id": gid,
+                "display_name": info.get("display_name", ""),
+                "job": info.get("job", ""),
+                "gear": info.get("gear", ""),
+                "availability": info.get("availability", ""),
+                "voice": info.get("voice", ""),
+                "note": info.get("note", ""),
+                "timestamp": info.get("timestamp", ""),
+            })
+
+    rows.sort(key=lambda x: (x["guild_id"], x["display_name"]))  # 簡單排序
+
+    return render_template_string(
+        HTML_TEMPLATE,
+        rows=rows,
+        total=len(rows),
+        guild_count=len(data),
+    )
+
+# ========= 同時啟動 Bot + Web =========
+
+def run_discord_bot():
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("環境變數 DISCORD_BOT_TOKEN 未設定")
+    bot.run(token)
+
+def run_flask():
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    # 本機測試用：同時跑 Flask + Bot
+    t = threading.Thread(target=run_discord_bot, daemon=True)
+    t.start()
+    run_flask()
