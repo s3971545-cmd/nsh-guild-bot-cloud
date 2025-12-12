@@ -1,3 +1,6 @@
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
 import os
 import json
 import io
@@ -10,36 +13,97 @@ from discord.ext import commands
 
 from flask import Flask, render_template_string, request, redirect, url_for
 
-DATA_FILE = "signups.json"
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# ========= 資料存取 =========
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("環境變數 DATABASE_URL 未設定（Render Postgres 未連上）")
+    # Render Postgres 通常需要 SSL
+    if "sslmode=" not in DATABASE_URL:
+        return psycopg2.connect(DATABASE_URL, sslmode="require")
+    return psycopg2.connect(DATABASE_URL)
 
-def load_signups():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            return {}
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signups (
+                    guild_id BIGINT NOT NULL,
+                    user_id  BIGINT NOT NULL,
+                    user_name TEXT,
+                    display_name TEXT,
+                    job TEXT,
+                    gear TEXT,
+                    availability TEXT,
+                    voice TEXT,
+                    note TEXT,
+                    team TEXT DEFAULT '未分配',
+                    timestamp TEXT,
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, user_id)
+                );
+            """)
+        conn.commit()
 
-def save_signups(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def db_upsert_signup(guild_id: int, user_id: int, info: dict):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO signups
+                (guild_id, user_id, user_name, display_name, job, gear, availability, voice, note, team, timestamp, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                    user_name=EXCLUDED.user_name,
+                    display_name=EXCLUDED.display_name,
+                    job=EXCLUDED.job,
+                    gear=EXCLUDED.gear,
+                    availability=EXCLUDED.availability,
+                    voice=EXCLUDED.voice,
+                    note=EXCLUDED.note,
+                    team=EXCLUDED.team,
+                    timestamp=EXCLUDED.timestamp,
+                    updated_at=NOW();
+            """, (
+                guild_id, user_id,
+                info.get("user_name"),
+                info.get("display_name"),
+                info.get("job"),
+                info.get("gear"),
+                info.get("availability"),
+                info.get("voice"),
+                info.get("note"),
+                info.get("team", "未分配"),
+                info.get("timestamp"),
+            ))
+        conn.commit()
 
-signups = load_signups()  # { guild_id: { user_id: {...} } }
+def db_get_signup(guild_id: int, user_id: int):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM signups WHERE guild_id=%s AND user_id=%s;", (guild_id, user_id))
+            return cur.fetchone()
 
-def get_guild_signups(guild_id: int):
-    gid = str(guild_id)
-    return signups.get(gid, {})
+def db_list_signups_by_guild(guild_id: int):
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM signups WHERE guild_id=%s ORDER BY display_name ASC;", (guild_id,))
+            return cur.fetchall()
 
-def set_signup(guild_id: int, user_id: int, info: dict):
-    gid = str(guild_id)
-    uid = str(user_id)
-    if gid not in signups:
-        signups[gid] = {}
-    signups[gid][uid] = info
-    save_signups(signups)
+def db_list_all_signups():
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM signups ORDER BY guild_id ASC, display_name ASC;")
+            return cur.fetchall()
+
+def db_update_team(guild_id: int, user_id: int, team: str):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE signups SET team=%s, updated_at=NOW()
+                WHERE guild_id=%s AND user_id=%s;
+            """, (team, guild_id, user_id))
+        conn.commit()
+
 
 # ========= Discord Bot =========
 
@@ -71,11 +135,13 @@ async def signup(
     user = interaction.user
 
     if guild is None:
+           
         await interaction.response.send_message("⚠️ 請在伺服器頻道內使用此指令。", ephemeral=True)
         return
 
-    existing = get_guild_signups(guild.id).get(str(user.id), {})
+    existing = db_get_signup(guild.id, user.id) or {}
     team = existing.get("team", "未分配")
+
 
     info = {
         "user_id": user.id,
@@ -86,11 +152,13 @@ async def signup(
         "availability": availability,
         "voice": voice,
         "note": note,
-        "team": team,  # ⭐ 新增：隊伍資訊
+        "team": team,
         "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
 
-    set_signup(guild.id, user.id, info)
+    db_upsert_signup(guild.id, user.id, info)
+
+
 
     embed = discord.Embed(
         title="✅ 幫戰報名成功",
@@ -116,8 +184,7 @@ async def mysignup(interaction: discord.Interaction):
         await interaction.response.send_message("⚠️ 請在伺服器頻道內使用此指令。", ephemeral=True)
         return
 
-    data = get_guild_signups(guild.id)
-    info = data.get(str(user.id))
+    info = db_get_signup(guild.id, user.id)
 
     if not info:
         await interaction.response.send_message("你還沒有填寫幫戰報名，可以使用 `/signup` 登記。", ephemeral=True)
@@ -150,7 +217,8 @@ async def list_signups(interaction: discord.Interaction):
         await interaction.response.send_message("🚫 你沒有使用此指令的權限（需管理伺服器權限）。", ephemeral=True)
         return
 
-    data = get_guild_signups(guild.id)
+    data = db_list_signups_by_guild(guild.id)
+
     if not data:
         await interaction.response.send_message("目前沒有任何幫戰報名資料。", ephemeral=True)
         return
@@ -160,7 +228,23 @@ async def list_signups(interaction: discord.Interaction):
     headers = ["UserID", "顯示名稱", "職業流派", "裝備境界", "可出席時段", "語音狀況", "隊伍", "備註", "最後更新時間"]
     output.write(",".join(headers) + "\n")
 
-    for uid, info in data.items():
+           for info in data:
+        uid = str(info["user_id"])
+        row = [
+            uid,
+            info.get("display_name", "").replace(",", "，"),
+            info.get("job", "").replace(",", "，"),
+            info.get("gear", "").replace(",", "，"),
+            info.get("availability", "").replace(",", "，"),
+            info.get("voice", "").replace(",", "，"),
+            info.get("team", "未分配").replace(",", "，"),
+            info.get("note", "").replace("\n", " ").replace(",", "，"),
+            info.get("timestamp", ""),
+        ]
+        output.write(",".join(row) + "\n")
+
+
+
         row = [
             uid,
             info.get("display_name", "").replace(",", "，"),
@@ -277,7 +361,7 @@ HTML_TEMPLATE = """
   <h1>⚔ 幫戰報名管理後台</h1>
   <p class="sub">
     這裡可以檢視所有報名名單，並調整每位成員的隊伍（進攻1 / 進攻2 / 防守 / 替補 / 請假/未分配）。<br>
-    調整後記得按下方「儲存隊伍調整」，隊伍會同步寫入 signups.json 與匯出的 CSV。
+    調整後記得按下方「儲存隊伍調整」，隊伍會同步寫入資料庫，並反映在匯出的 CSV。
   </p>
 
   <div class="summary-bar">
@@ -354,89 +438,86 @@ HTML_TEMPLATE = """
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    data = load_signups()
-
-    # 如果是從網頁送出隊伍調整（POST）
+    # ===== POST：儲存隊伍（寫入 PostgreSQL）=====
     if request.method == "POST":
         for key, value in request.form.items():
             if not key.startswith("team_"):
                 continue
             _, gid, uid = key.split("_", 2)
-            if gid in data and uid in data[gid]:
-                data[gid][uid]["team"] = value  # 更新隊伍
-        save_signups(data)
-        signups.clear()
-        signups.update(data)
+            db_update_team(int(gid), int(uid), value)
         return redirect(url_for("index"))
 
-    # GET：顯示畫面（分隊伍分區塊）
-    teams_order = ["進攻1", "進攻2", "防守", "替補", "請假", "未分配"]
+    # ===== GET：從 PostgreSQL 讀取資料 =====
+    rows_raw = db_list_all_signups()  # ← 關鍵：不再用 data.items()
 
+    teams_order = ["進攻1", "進攻2", "防守", "替補", "請假", "未分配"]
+    class_map = {
+        "進攻1": "team-off1",
+        "進攻2": "team-off2",
+        "防守": "team-def",
+        "替補": "team-sub",
+        "請假": "team-leave",
+        "未分配": "team-unassigned",
+    }
+
+    # 依隊伍分組
     team_blocks = {t: [] for t in teams_order}
 
-    # 顏色 / 樣式 class
-    class_map = {
-    "進攻1": "team-off1",
-    "進攻2": "team-off2",
-    "防守": "team-def",
-    "替補": "team-sub",
-    "請假": "team-leave",
-    "未分配": "team-unassigned",
-}
+    for r in rows_raw:
+        team = r.get("team") or "未分配"
+        if team not in team_blocks:
+            team = "未分配"
 
+        row = {
+            "guild_id": str(r["guild_id"]),
+            "user_id": str(r["user_id"]),
+            "display_name": r.get("display_name", ""),
+            "job": r.get("job", ""),
+            "gear": r.get("gear", ""),
+            "availability": r.get("availability", ""),
+            "voice": r.get("voice", ""),
+            "note": r.get("note", ""),
+            "team": team,
+            "team_class": class_map.get(team, "team-unassigned"),
+            "timestamp": r.get("timestamp", ""),
+        }
 
-    for gid, guild_data in data.items():
-        for uid, info in guild_data.items():
-            team = info.get("team", "未分配")
-            if team not in teams_order:
-                team = "未分配"
+        team_blocks[team].append(row)
 
-            row = {
-                "guild_id": gid,
-                "user_id": uid,
-                "display_name": info.get("display_name", ""),
-                "job": info.get("job", ""),
-                "gear": info.get("gear", ""),
-                "availability": info.get("availability", ""),
-                "voice": info.get("voice", ""),
-                "note": info.get("note", ""),
-                "team": team,
-                "team_class": class_map.get(team, "team-unassigned"),
-                "timestamp": info.get("timestamp", ""),
-            }
-            team_blocks[team].append(row)
-
-    # 整理成 sections 給模板使用
+    # 組合給 HTML 用的 sections
     sections = []
+    summary = []
     total = 0
+
     for t in teams_order:
         rows = sorted(team_blocks[t], key=lambda x: (x["guild_id"], x["display_name"]))
-        total += len(rows)
+        count = len(rows)
+        total += count
+
         sections.append({
             "team": t,
             "rows": rows,
-            "count": len(rows),
+            "count": count,
             "badge_class": class_map.get(t, "team-unassigned"),
         })
 
-    # 統計用 summary
-    summary = []
-    for t in teams_order:
         summary.append({
             "team": t,
-            "count": len(team_blocks[t]),
+            "count": count,
             "team_class": class_map.get(t, "team-unassigned"),
         })
 
-    guild_count = len(data)
+    guild_count = len(set(r["guild_id"] for r in rows_raw))
 
     return render_template_string(
         HTML_TEMPLATE,
         sections=sections,
+        summary=summary,
         total=total,
         guild_count=guild_count,
-        summary=summary,
     )
+
+
 
 # ========= 同時啟動 Bot + Web =========
 
@@ -451,7 +532,8 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # 本機測試用：同時跑 Flask + Bot
+    init_db()
     t = threading.Thread(target=run_discord_bot, daemon=True)
     t.start()
     run_flask()
+
